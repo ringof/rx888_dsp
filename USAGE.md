@@ -21,7 +21,7 @@ Why the optional buffer: GQRX can be sensitive to FIFO read jitter at ~257 MiB/s
 
 ### Compile
 ```
-gcc -O3 -march=native -mavx2 -mfma -std=c11 -o rx888_dsp rx888_dsp_robust_fifo.c -lm -lpthread -Wall -Wextra
+gcc -O3 -march=native -mavx2 -mfma -std=c11 -o rx888_dsp rx888_dsp.c -lm -lpthread -Wall -Wextra
 ```
 
 Tip: `-march=native` usually includes `-mavx2 -mfma` automatically on AVX2 CPUs, but keeping them explicit is fine.

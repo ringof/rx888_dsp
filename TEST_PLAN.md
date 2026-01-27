@@ -49,6 +49,21 @@ Pass criteria:
 
 ---
 
+### A1b) Single-block framing sanity check
+Goal: ensure exactly one input block yields exactly one output block with correct byte size.
+
+Command:
+```
+head -c 524288 /dev/zero | ./rx888_dsp --block-on-full > /tmp/rx888_iq.out
+ls -l /tmp/rx888_iq.out
+```
+
+Pass criteria:
+- output file size is exactly 524,288 bytes (one block)
+- process exits cleanly after EOF
+
+---
+
 ### A2) Rate-shaped input stress test
 Goal: simulate “real rate” pacing using pv shaping.
 
