@@ -50,7 +50,7 @@ RX888 source (135e6 real int16)
 
 ## 4. DSP Pipeline Summary
 
-### Stage 1 — Real to Complex + -Fs/4 Shift
+### Stage 1 — Real to Complex -Fs/4 Shift
 - Converts int16 real samples to float32
 - Applies a -Fs/4 frequency shift to generate an analytic signal
 - Avoids a Hilbert transform by exploiting the Fs/4 identity

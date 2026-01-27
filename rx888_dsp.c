@@ -972,13 +972,13 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Signal handling: use sigaction() for reliability (and SA_RESTART). */
+    /* Signal handling: use sigaction() for reliability (avoid SA_RESTART). */
 {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
+    sa.sa_flags = 0;
 
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
