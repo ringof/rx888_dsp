@@ -288,7 +288,6 @@ static inline void stage1_convert_and_shift(buffer_t *buf) {
     // This keeps the code readable while still removing a lot of conversion overhead.
     const float scale = 1.0f / 32768.0f;
 
-#ifdef __AVX2__
     // Process 16 int16 samples per iteration.
     // INPUT_SAMPLES is divisible by 16, so no tail path needed for normal operation.
     const int16_t *in = buf->input;
@@ -327,20 +326,6 @@ static inline void stage1_convert_and_shift(buffer_t *buf) {
             Iptr[n + 3] = 0.0f; Qptr[n + 3] =  v3;   // * ( j)
         }
     }
-#else
-    // Portable scalar fallback
-    for (int i = 0; i < INPUT_SAMPLES; i += 4) {
-        float v0 = buf->input[i]     * scale;
-        float v1 = buf->input[i + 1] * scale;
-        float v2 = buf->input[i + 2] * scale;
-        float v3 = buf->input[i + 3] * scale;
-
-        buf->stage1I[i]     =  v0;  buf->stage1Q[i]     = 0.0f;
-        buf->stage1I[i + 1] = 0.0f; buf->stage1Q[i + 1] = -v1;
-        buf->stage1I[i + 2] = -v2;  buf->stage1Q[i + 2] = 0.0f;
-        buf->stage1I[i + 3] = 0.0f; buf->stage1Q[i + 3] =  v3;
-    }
-#endif
 }
 
 //=============================================================================
