@@ -6,10 +6,12 @@
  *   Input:   16-bit signed real samples on stdin at Fs = 135 MS/s (typical).
  *   Output:  complex 32-bit float IQ at Fs/4 after two halfband decimation stages.
  *
- * Pipeline overview (4 DSP stages)
+ * Pipeline overview (conceptually 4 DSP stages; implemented with fusion)
  *   Stage 1: int16 real -> float IQ with -Fs/4 frequency shift (real->complex conversion).
+ *            Implemented by directly filling Stage 2's extended window (fused into Stage 2).
  *   Stage 2: Halfband FIR #1, decimate-by-2 (Fs/2).
- *   Stage 3: +Fs/4 frequency shift (compensates Stage 1 mixing to place spectrum at baseband).
+ *   Stage 3: +Fs/4 frequency shift (cancels Stage 1 mixing to place spectrum at baseband).
+ *            Implemented while filling Stage 4's extended window (fused into Stage 4).
  *   Stage 4: Halfband FIR #2, decimate-by-2 (Fs/4).
  *
  * Performance notes
@@ -34,6 +36,7 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -41,7 +44,6 @@
 #include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include <complex.h>
 #include <immintrin.h>
 
 // Buffer sizes
@@ -119,7 +121,7 @@ typedef struct {
     float outQ[OUTPUT_SAMPLES];
     float output[OUTPUT_SAMPLES * 2];  // interleaved [I0,Q0,I1,Q1,...]
 
-    volatile int state;
+    // state: unused (queues provide synchronization). Kept out to avoid confusion.
 } buffer_t;
 
 // C11 atomic SPSC queue
@@ -138,6 +140,7 @@ static spsc_queue_t filled_queue;  // Ready for processing
 static spsc_queue_t ready_queue;   // Ready to output
 
 static volatile sig_atomic_t stop_flag = 0;
+static volatile sig_atomic_t stats_req_flag = 0;  // set by SIGUSR1, consumed by processing thread
 
 /* Compromise vs. full refactor:
    Keep the DSP hot-path globals as-is, but group program configuration / output state. */
@@ -156,19 +159,24 @@ static app_ctx_t g_app = {
 };
 
 #define PROGRAM_NAME "rx888_dsp"
+#ifndef EXIT_USAGE
+#define EXIT_USAGE 2
+#endif
+
+#ifndef RX888_DSP_VERSION
+#define RX888_DSP_VERSION "dev"
+#endif
+
 
 /* Logging: errors always go to stderr; info only with -v. */
 #define LOG_ERR(fmt, ...)  fprintf(stderr, PROGRAM_NAME ": " fmt, ##__VA_ARGS__)
+#define LOG_SYSERR(ctx)    fprintf(stderr, PROGRAM_NAME ": %s: %s\n", (ctx), strerror(errno))
 #define LOG_INFO(fmt, ...) do { if (g_app.verbose) fprintf(stderr, PROGRAM_NAME ": " fmt, ##__VA_ARGS__); } while (0)
 
 static unsigned long samples_processed = 0;
-static unsigned long blocks_dropped = 0;
+static _Atomic unsigned long blocks_dropped = 0;
 
 // History buffers for streaming FIR
-static float *hb1_histI = NULL;
-static float *hb1_histQ = NULL;
-static float *hb2_histI = NULL;
-static float *hb2_histQ = NULL;
 static float *hb2_extI = NULL;  // Stage4 working buffer: extended I
 static float *hb2_extQ = NULL;  // Stage4 working buffer: extended Q
 static float *hb2_eI = NULL, *hb2_eQ = NULL; // even phase I/Q (contiguous)
@@ -270,7 +278,7 @@ static ssize_t read_full(int fd, void *buf, size_t bytes)
 // Stage 1: Convert int16 to complex with -Fs/4 shift
 //=============================================================================
 
-static inline void stage1_convert_and_shift(buffer_t *buf) {
+static inline void stage1_convert_and_shift_into(const int16_t *in, float *Iptr, float *Qptr) {
     // Convert int16 real samples to complex baseband using a -Fs/4 shift.
     //
     // Multiply by exp(-j*pi/2*n) = [1, -j, -1, j] repeating.
@@ -291,10 +299,6 @@ static inline void stage1_convert_and_shift(buffer_t *buf) {
 #ifdef __AVX2__
     // Process 16 int16 samples per iteration.
     // INPUT_SAMPLES is divisible by 16, so no tail path needed for normal operation.
-    const int16_t *in = buf->input;
-    float *Iptr = buf->stage1I;
-    float *Qptr = buf->stage1Q;
-
     const __m256 scalev = _mm256_set1_ps(scale);
     float tmp[16] __attribute__((aligned(32)));
 
@@ -330,21 +334,28 @@ static inline void stage1_convert_and_shift(buffer_t *buf) {
 #else
     // Portable scalar fallback
     for (int i = 0; i < INPUT_SAMPLES; i += 4) {
-        float v0 = buf->input[i]     * scale;
-        float v1 = buf->input[i + 1] * scale;
-        float v2 = buf->input[i + 2] * scale;
-        float v3 = buf->input[i + 3] * scale;
+        float v0 = in[i]     * scale;
+        float v1 = in[i + 1] * scale;
+        float v2 = in[i + 2] * scale;
+        float v3 = in[i + 3] * scale;
 
-        buf->stage1I[i]     =  v0;  buf->stage1Q[i]     = 0.0f;
-        buf->stage1I[i + 1] = 0.0f; buf->stage1Q[i + 1] = -v1;
-        buf->stage1I[i + 2] = -v2;  buf->stage1Q[i + 2] = 0.0f;
-        buf->stage1I[i + 3] = 0.0f; buf->stage1Q[i + 3] =  v3;
+        Iptr[i]     =  v0;  Qptr[i]     = 0.0f;
+        Iptr[i + 1] = 0.0f; Qptr[i + 1] = -v1;
+        Iptr[i + 2] = -v2;  Qptr[i + 2] = 0.0f;
+        Iptr[i + 3] = 0.0f; Qptr[i + 3] =  v3;
     }
 #endif
 }
 
+// Backward-compatible wrapper (kept for readability; should be optimized away)
+static inline void stage1_convert_and_shift(buffer_t *buf) {
+    stage1_convert_and_shift_into(buf->input, buf->stage1I, buf->stage1Q);
+}
+
+
 //=============================================================================
 // Stage 2: HB1 with history (streaming FIR) producing SoA I/Q
+// (Stage 1 conversion + -Fs/4 shift is fused here by filling the current-block region of extI/extQ.)
 //
 // IMPORTANT: This is a *causal* streaming FIR:
 //   y[m] = sum_{k=0..L-1} h[k] * x[2m - k]
@@ -354,7 +365,7 @@ static inline void stage1_convert_and_shift(buffer_t *buf) {
 // eliminates bounds checks in the inner loop, and is correct across blocks.
 //=============================================================================
 
-static inline void stage2_hb1_stream_soa(buffer_t *buf, float *histI, float *histQ) {
+static inline void stage2_hb1_stream_soa(buffer_t *buf) {
     // HB1 decimate-by-2, causal streaming FIR on SoA data:
     //   y[m] = sum_{k=0..L-1} h[k] * x[2m - k]
     //
@@ -373,11 +384,9 @@ static inline void stage2_hb1_stream_soa(buffer_t *buf, float *histI, float *his
     static float extI[(HB1_LEN - 1) + STAGE1_SAMPLES];
     static float extQ[(HB1_LEN - 1) + STAGE1_SAMPLES];
 
-    memcpy(extI, histI, H * sizeof(float));
-    memcpy(extQ, histQ, H * sizeof(float));
-    memcpy(extI + H, buf->stage1I, STAGE1_SAMPLES * sizeof(float));
-    memcpy(extQ + H, buf->stage1Q, STAGE1_SAMPLES * sizeof(float));
-
+    // Stage-2 window: ext[0..H) carries history across blocks.
+    // We only fill the current block region each call.
+    stage1_convert_and_shift_into(buf->input, extI + H, extQ + H);
     // Pre-fetch the few non-zero coefficients we use (compiler will keep in regs)
     const float h1_0 = h1[0];
     const float h1_2 = h1[2];
@@ -414,8 +423,9 @@ static inline void stage2_hb1_stream_soa(buffer_t *buf, float *histI, float *his
         buf->stage2Q[m] = accQ;
     }
 
-    memcpy(histI, extI + STAGE1_SAMPLES, H * sizeof(float));
-    memcpy(histQ, extQ + STAGE1_SAMPLES, H * sizeof(float));
+    // Slide history forward: last H samples become next block's history.
+    memcpy(extI, extI + STAGE1_SAMPLES, H * sizeof(float));
+    memcpy(extQ, extQ + STAGE1_SAMPLES, H * sizeof(float));
 }
 
 //=============================================================================
@@ -426,6 +436,9 @@ static inline void stage2_hb1_stream_soa(buffer_t *buf, float *histI, float *his
 // In SoA this is just sign flips and (I,Q) swaps.
 //=============================================================================
 
+#if 0
+// Reference implementation kept for documentation.
+// Stage 3 (+Fs/4 shift) is fused into Stage 4 ext-fill for performance.
 static inline void stage3_shift_fs4_soa(buffer_t *buf) {
     // AVX2 version (SoA): multiply by repeating [1, j, -1, -j].
     // For each index i:
@@ -508,6 +521,8 @@ static inline void stage3_shift_fs4_soa(buffer_t *buf) {
         }
     }
 }
+#endif
+
 
 //=============================================================================
 // Stage 4: HB2 decimate-by-2 using folded halfband symmetry + AVX2 (SoA)
@@ -613,47 +628,128 @@ static inline void hb2_decim2_folded_avx2_soa(
 static inline void stage4_hb2_stream_folded_avx2(buffer_t *buf) {
     const int L = HB2_LEN;
     const int H = L - 1; // 234
+    // Stage4 window: hb2_ext[0..H) holds history from prior block; hb2_ext[H..H+N) is filled each block.
+    // Fused Stage 3 (+Fs/4) shift while filling the current-block portion of hb2_ext[].
+    // Stage-3 phase pattern repeats every 4 samples and STAGE2_SAMPLES is a multiple of 8,
+    // so we can use one fixed mask set for all 8-wide vectors (phases 0..3 twice).
+    {
+    const __m256 swap_mask = _mm256_castsi256_ps(_mm256_setr_epi32(
+        0, -1, 0, -1, 0, -1, 0, -1));  // swap lanes 1,3,5,7
+    const __m256 signI = _mm256_castsi256_ps(_mm256_setr_epi32(
+        0x00000000, 0x80000000, 0x80000000, 0x00000000,
+        0x00000000, 0x80000000, 0x80000000, 0x00000000)); // negate I on phases 1,2
+    const __m256 signQ = _mm256_castsi256_ps(_mm256_setr_epi32(
+        0x00000000, 0x00000000, 0x80000000, 0x80000000,
+        0x00000000, 0x00000000, 0x80000000, 0x80000000)); // negate Q on phases 2,3
 
-    // Build extended SoA buffers: extI/extQ = [history | current_block]
-    memcpy(hb2_extI, hb2_histI, H * sizeof(float));
-    memcpy(hb2_extQ, hb2_histQ, H * sizeof(float));
-    memcpy(hb2_extI + H, buf->stage2I, STAGE2_SAMPLES * sizeof(float));
-    memcpy(hb2_extQ + H, buf->stage2Q, STAGE2_SAMPLES * sizeof(float));
+    const float *srcI = buf->stage2I;
+    const float *srcQ = buf->stage2Q;
+    float *dstI = hb2_extI + H;
+    float *dstQ = hb2_extQ + H;
+
+    for (int i = 0; i < STAGE2_SAMPLES; i += 8) {
+        const __m256 vI = _mm256_loadu_ps(srcI + i);
+        const __m256 vQ = _mm256_loadu_ps(srcQ + i);
+
+        // swap candidates
+        const __m256 vI_sw = vQ;
+        const __m256 vQ_sw = vI;
+
+        __m256 outI = _mm256_blendv_ps(vI, vI_sw, swap_mask);
+        __m256 outQ = _mm256_blendv_ps(vQ, vQ_sw, swap_mask);
+
+        outI = _mm256_xor_ps(outI, signI);
+        outQ = _mm256_xor_ps(outQ, signQ);
+
+        _mm256_storeu_ps(dstI + i, outI);
+        _mm256_storeu_ps(dstQ + i, outQ);
+    }
+}
 
     const int ext_len = H + STAGE2_SAMPLES;
 
     // Materialize even/odd phase arrays (contiguous) for SIMD.
 //
-// This is bandwidth-bound. We use AVX2 to deinterleave ext[] into even/odd:
+// We deinterleave ext[] into even/odd phase arrays:
 //   e[m] = ext[2m]
 //   o[m] = ext[2m+1]
 //
-// ext_len is even here (234 + 131072 = 131306), so e_len == o_len == ext_len/2.
+// This step is pure data movement; keep it throughput-friendly.
+//
+// Why we need this:
+//   The folded halfband decimator is implemented as a 2-phase polyphase FIR.
+//   It naturally consumes two contiguous streams: the even samples ext[2m] and
+//   the odd samples  ext[2m+1]. Materializing these as contiguous arrays turns
+//   the FIR inner-loop into simple unit-stride loads (ideal for AVX2/FMA).
+//
+// Performance note:
+//   Avoid variable-index permutes (vpermps) here; on many AVX2 CPUs they're
+//   noticeably more expensive than fixed shuffles/unpacks.  The sequence below
+//   uses only fixed-lane shuffles, then stitches 128-bit halves to build
+//   8-wide vectors:
+//
+//     a = ext[i + 0..7], b = ext[i + 8..15]
+//     tE = shuffle(a,b,0x88) -> [0,2,8,10 | 4,6,12,14]
+//     tO = shuffle(a,b,0xDD) -> [1,3,9,11 | 5,7,13,15]
+//     then within 128-bit halves, shuffle to get:
+//       E = [0,2,4,6 | 8,10,12,14]
+//       O = [1,3,5,7 | 9,11,13,15]
     {
-        const int n8 = ext_len & ~7;      // round down to multiple of 8
-        const __m256i idx_even = _mm256_setr_epi32(0,2,4,6, 0,2,4,6);
-        const __m256i idx_odd  = _mm256_setr_epi32(1,3,5,7, 1,3,5,7);
+        const int n16 = ext_len & ~15; // round down to multiple of 16
 
-        for (int i = 0; i < n8; i += 8) {
-            const int m4 = i >> 1; // i/2: each 8 inputs produce 4 evens + 4 odds
+        for (int i = 0; i < n16; i += 16) {
+            const int m8 = i >> 1; // i/2: each 16 inputs produce 8 evens + 8 odds
 
-            __m256 vI = _mm256_loadu_ps(hb2_extI + i);
-            __m256 vQ = _mm256_loadu_ps(hb2_extQ + i);
+            // I
+            __m256 aI = _mm256_loadu_ps(hb2_extI + i);
+            __m256 bI = _mm256_loadu_ps(hb2_extI + i + 8);
+            __m256 tEI = _mm256_shuffle_ps(aI, bI, 0x88);
+            __m256 tOI = _mm256_shuffle_ps(aI, bI, 0xDD);
 
-            __m256 eI8 = _mm256_permutevar8x32_ps(vI, idx_even);
-            __m256 oI8 = _mm256_permutevar8x32_ps(vI, idx_odd);
-            __m256 eQ8 = _mm256_permutevar8x32_ps(vQ, idx_even);
-            __m256 oQ8 = _mm256_permutevar8x32_ps(vQ, idx_odd);
+            __m128 tEI_lo = _mm256_castps256_ps128(tEI);
+            __m128 tEI_hi = _mm256_extractf128_ps(tEI, 1);
+            __m128 tOI_lo = _mm256_castps256_ps128(tOI);
+            __m128 tOI_hi = _mm256_extractf128_ps(tOI, 1);
 
-            // low 128 contains the 4 desired lanes: [0,2,4,6] or [1,3,5,7]
-            _mm_storeu_ps(hb2_eI + m4, _mm256_castps256_ps128(eI8));
-            _mm_storeu_ps(hb2_oI + m4, _mm256_castps256_ps128(oI8));
-            _mm_storeu_ps(hb2_eQ + m4, _mm256_castps256_ps128(eQ8));
-            _mm_storeu_ps(hb2_oQ + m4, _mm256_castps256_ps128(oQ8));
+            __m128 eI_lo = _mm_shuffle_ps(tEI_lo, tEI_hi, 0x44); // [0,2,4,6]
+            __m128 eI_hi = _mm_shuffle_ps(tEI_lo, tEI_hi, 0xEE); // [8,10,12,14]
+            __m128 oI_lo = _mm_shuffle_ps(tOI_lo, tOI_hi, 0x44); // [1,3,5,7]
+            __m128 oI_hi = _mm_shuffle_ps(tOI_lo, tOI_hi, 0xEE); // [9,11,13,15]
+
+            __m256 eI = _mm256_castps128_ps256(eI_lo);
+            eI = _mm256_insertf128_ps(eI, eI_hi, 1);
+            __m256 oI = _mm256_castps128_ps256(oI_lo);
+            oI = _mm256_insertf128_ps(oI, oI_hi, 1);
+
+            // Q
+            __m256 aQ = _mm256_loadu_ps(hb2_extQ + i);
+            __m256 bQ = _mm256_loadu_ps(hb2_extQ + i + 8);
+            __m256 tEQ = _mm256_shuffle_ps(aQ, bQ, 0x88);
+            __m256 tOQ = _mm256_shuffle_ps(aQ, bQ, 0xDD);
+
+            __m128 tEQ_lo = _mm256_castps256_ps128(tEQ);
+            __m128 tEQ_hi = _mm256_extractf128_ps(tEQ, 1);
+            __m128 tOQ_lo = _mm256_castps256_ps128(tOQ);
+            __m128 tOQ_hi = _mm256_extractf128_ps(tOQ, 1);
+
+            __m128 eQ_lo = _mm_shuffle_ps(tEQ_lo, tEQ_hi, 0x44);
+            __m128 eQ_hi = _mm_shuffle_ps(tEQ_lo, tEQ_hi, 0xEE);
+            __m128 oQ_lo = _mm_shuffle_ps(tOQ_lo, tOQ_hi, 0x44);
+            __m128 oQ_hi = _mm_shuffle_ps(tOQ_lo, tOQ_hi, 0xEE);
+
+            __m256 eQ = _mm256_castps128_ps256(eQ_lo);
+            eQ = _mm256_insertf128_ps(eQ, eQ_hi, 1);
+            __m256 oQ = _mm256_castps128_ps256(oQ_lo);
+            oQ = _mm256_insertf128_ps(oQ, oQ_hi, 1);
+
+            _mm256_storeu_ps(hb2_eI + m8, eI);
+            _mm256_storeu_ps(hb2_oI + m8, oI);
+            _mm256_storeu_ps(hb2_eQ + m8, eQ);
+            _mm256_storeu_ps(hb2_oQ + m8, oQ);
         }
 
-        // Scalar cleanup for any remaining samples (ext_len mod 8).
-        for (int i = n8; i < ext_len; i++) {
+        // Scalar cleanup for tail (ext_len mod 16).
+        for (int i = n16; i < ext_len; i++) {
             int m1 = i >> 1;
             if ((i & 1) == 0) {
                 hb2_eI[m1] = hb2_extI[i];
@@ -664,7 +760,6 @@ static inline void stage4_hb2_stream_folded_avx2(buffer_t *buf) {
             }
         }
     }
-
 
     // Run AVX2 halfband decimator (writes SoA outI/outQ)
     hb2_decim2_folded_avx2_soa(hb2_eI, hb2_eQ, hb2_oI, hb2_oQ, buf->outI, buf->outQ, OUTPUT_SAMPLES);
@@ -683,12 +778,20 @@ static inline void stage4_hb2_stream_folded_avx2(buffer_t *buf) {
 
             // [I0,Q0,I1,Q1,I2,Q2,I3,Q3]
             __m256 lo = _mm256_unpacklo_ps(vI, vQ);
-            // [I4,Q4,I5,Q5,I6,Q6,I7,Q7]
             __m256 hi = _mm256_unpackhi_ps(vI, vQ);
 
-            const size_t o = ((size_t)i) << 1; // 2*i
-            _mm256_storeu_ps(dst + o + 0, lo);
-            _mm256_storeu_ps(dst + o + 8, hi);
+            // NOTE: unpack* operates on 128-bit lanes independently.
+            // lo = [I0,Q0,I1,Q1 | I4,Q4,I5,Q5]
+            // hi = [I2,Q2,I3,Q3 | I6,Q6,I7,Q7]
+            // We must re-stitch lanes to produce contiguous IQ order:
+            // out0 = [I0,Q0,I1,Q1,I2,Q2,I3,Q3]
+            // out1 = [I4,Q4,I5,Q5,I6,Q6,I7,Q7]
+            __m256 out0 = _mm256_permute2f128_ps(lo, hi, 0x20);
+            __m256 out1 = _mm256_permute2f128_ps(lo, hi, 0x31);
+
+            const size_t o = ((size_t)i) << 1; // 2*i floats
+            _mm256_storeu_ps(dst + o + 0, out0);
+            _mm256_storeu_ps(dst + o + 8, out1);
         }
 
         // Scalar cleanup.
@@ -698,10 +801,9 @@ static inline void stage4_hb2_stream_folded_avx2(buffer_t *buf) {
             dst[o + 1] = srcQ[i];
         }
     }
-
-    // Save last H samples of input (stage2 domain) for next block
-    memcpy(hb2_histI, hb2_extI + STAGE2_SAMPLES, H * sizeof(float));
-    memcpy(hb2_histQ, hb2_extQ + STAGE2_SAMPLES, H * sizeof(float));
+    // Slide the Stage4 history window forward for next block (copy last H samples to front).
+    memcpy(hb2_extI, hb2_extI + STAGE2_SAMPLES, H * sizeof(float));
+    memcpy(hb2_extQ, hb2_extQ + STAGE2_SAMPLES, H * sizeof(float));
 }
 
 //=============================================================================
@@ -715,45 +817,72 @@ static void* processing_thread(void *arg) {
     // Allocate working buffers for Stage 4 (HB2) using posix_memalign.
 // NOTE: aligned_alloc() requires size be a multiple of alignment; these sizes are not.
 {
-    const int H = HB2_LEN - 1;                // 234
-    const int ext_len = H + STAGE2_SAMPLES;   // 131306
-    const int e_len = (ext_len + 1) / 2;      // 65653
-    const int o_len = ext_len / 2;            // 65653
-    void *p = NULL;
+    const int H       = HB2_LEN - 1;              // history length
+    const int ext_len = H + STAGE2_SAMPLES;       // history + current block
+    const int e_len   = (ext_len + 1) / 2;        // even phase length (ceil)
+    const int o_len   = ext_len / 2;              // odd  phase length (floor)
 
-    if (posix_memalign(&p, 64, ext_len * sizeof(float)) != 0) p = NULL;
-    hb2_extI = (float*)p;
-
-    if (posix_memalign(&p, 64, ext_len * sizeof(float)) != 0) p = NULL;
-    hb2_extQ = (float*)p;
-
-    if (posix_memalign(&p, 64, e_len * sizeof(float)) != 0) p = NULL;
-    hb2_eI = (float*)p;
-
-    if (posix_memalign(&p, 64, e_len * sizeof(float)) != 0) p = NULL;
-    hb2_eQ = (float*)p;
-
-    if (posix_memalign(&p, 64, o_len * sizeof(float)) != 0) p = NULL;
-    hb2_oI = (float*)p;
-
-    if (posix_memalign(&p, 64, o_len * sizeof(float)) != 0) p = NULL;
-    hb2_oQ = (float*)p;
+    // Allocate each buffer directly; do not reuse a shared 'p' pointer.
+    if (posix_memalign((void**)&hb2_extI, 64, (size_t)ext_len * sizeof(float)) != 0) hb2_extI = NULL;
+    if (posix_memalign((void**)&hb2_extQ, 64, (size_t)ext_len * sizeof(float)) != 0) hb2_extQ = NULL;
+    if (posix_memalign((void**)&hb2_eI,   64, (size_t)e_len   * sizeof(float)) != 0) hb2_eI   = NULL;
+    if (posix_memalign((void**)&hb2_eQ,   64, (size_t)e_len   * sizeof(float)) != 0) hb2_eQ   = NULL;
+    if (posix_memalign((void**)&hb2_oI,   64, (size_t)o_len   * sizeof(float)) != 0) hb2_oI   = NULL;
+    if (posix_memalign((void**)&hb2_oQ,   64, (size_t)o_len   * sizeof(float)) != 0) hb2_oQ   = NULL;
 
     if (!hb2_extI || !hb2_extQ || !hb2_eI || !hb2_eQ || !hb2_oI || !hb2_oQ) {
-    LOG_ERR("FATAL: failed to allocate Stage4 working buffers (out of memory?)\n");
-    free(hb2_extI); hb2_extI = NULL;
-    free(hb2_extQ); hb2_extQ = NULL;
-    free(hb2_eI);   hb2_eI   = NULL;
-    free(hb2_eQ);   hb2_eQ   = NULL;
-    free(hb2_oI);   hb2_oI   = NULL;
-    free(hb2_oQ);   hb2_oQ   = NULL;
-    stop_flag = 1; /* signal main thread to stop */
-    return NULL;
+        LOG_ERR("failed to allocate Stage4 working buffers (out of memory?)\n");
+        free(hb2_extI); hb2_extI = NULL;
+        free(hb2_extQ); hb2_extQ = NULL;
+        free(hb2_eI);   hb2_eI   = NULL;
+        free(hb2_eQ);   hb2_eQ   = NULL;
+        free(hb2_oI);   hb2_oI   = NULL;
+        free(hb2_oQ);   hb2_oQ   = NULL;
+        stop_flag = 1; /* signal main thread to stop */
+        return NULL;
+    }
+
+    // Initialize Stage4 history window (hb2_ext[0..H)) to zeros once.
+    memset(hb2_extI, 0, (size_t)H * sizeof(float));
+    memset(hb2_extQ, 0, (size_t)H * sizeof(float));
 }
-}
+
     
     while (!stop_flag) {
         buffer_t *buf = spsc_pop(&filled_queue);
+        if (stats_req_flag) {
+            /* Print stats on demand (SIGUSR1). This check is once per block and
+               does not touch the SIMD inner loops. */
+            stats_req_flag = 0;
+
+            const unsigned long dropped =
+                    atomic_load_explicit(&blocks_dropped, memory_order_relaxed);
+            const unsigned long total = stats.total_blocks + dropped;
+            const double drop_pct =
+                    (total > 0) ? (100.0 * (double)dropped / (double)total) : 0.0;
+            const double headroom_pct =
+                    (stats.avg_time_ms > 0) ? (100.0 * (1.94 - stats.avg_time_ms) / 1.94) : 0.0;
+
+            if (!g_app.verbose) {
+                fprintf(stderr,
+                        PROGRAM_NAME ": SIGUSR1: blocks=%lu dropped=%lu(%.2f%%) "
+                                     "avg=%.2fms headroom=%.1f%% out=%lu\n",
+                        stats.total_blocks, dropped, drop_pct, stats.avg_time_ms, headroom_pct,
+                        samples_processed);
+            } else {
+                fprintf(stderr, PROGRAM_NAME ": === Statistics (SIGUSR1) ===\n");
+                fprintf(stderr, PROGRAM_NAME ": Blocks processed: %lu\n", stats.total_blocks);
+                if (total > 0) {
+                    fprintf(stderr, PROGRAM_NAME ": Blocks dropped:   %lu (%.2f%%)\n", dropped, drop_pct);
+                } else {
+                    fprintf(stderr, PROGRAM_NAME ": Blocks dropped:   %lu (no data processed)\n", dropped);
+                }
+                fprintf(stderr, PROGRAM_NAME ": Time/block: avg %.2f ms (min %.2f, max %.2f)\n",
+                        stats.avg_time_ms, stats.min_time_ms, stats.max_time_ms);
+                fprintf(stderr, PROGRAM_NAME ": Samples output: %lu\n", samples_processed);
+            }
+        }
+
         if (!buf) {
             struct timespec ts = {0, 100000};  // 100 us
             nanosleep(&ts, NULL);
@@ -762,12 +891,11 @@ static void* processing_thread(void *arg) {
         
         unsigned long start = get_time_us();
         
-        // Processing pipeline with streaming FIR
-        stage1_convert_and_shift(buf);
-        stage2_hb1_stream_soa(buf, hb1_histI, hb1_histQ);
-        stage3_shift_fs4_soa(buf);
+        // DSP pipeline (fused stages):
+        //   Stage 1+2: int16->float IQ with -Fs/4 shift, then HB1 decimate-by-2 -> stage2I/Q
+        //   Stage 3+4: apply +Fs/4 shift while filling HB2 window, then HB2 decimate-by-2 -> outI/Q
+        stage2_hb1_stream_soa(buf);
         stage4_hb2_stream_folded_avx2(buf);
-        
         unsigned long elapsed = get_time_us() - start;
         double time_ms = elapsed / 1000.0;
         
@@ -788,7 +916,7 @@ static void* processing_thread(void *arg) {
                     spsc_push(&free_queue, buf);
                 }
             } else {
-                blocks_dropped++;
+                atomic_fetch_add_explicit(&blocks_dropped, 1, memory_order_relaxed);
                 spsc_push(&free_queue, buf);
             }
         }
@@ -817,13 +945,13 @@ static void* output_thread(void *arg) {
     if (g_app.output_path) {
         struct stat st;
         if (stat(g_app.output_path, &st) != 0) {
-            LOG_ERR("FATAL: output path '%s' not found (create with: mkfifo %s)\n",
+            LOG_ERR("output path '%s' not found (create with: mkfifo %s)\n",
                     g_app.output_path, g_app.output_path);
             stop_flag = 1;
             return NULL;
         }
         if (!S_ISFIFO(st.st_mode)) {
-            LOG_ERR("FATAL: output path '%s' is not a FIFO\n", g_app.output_path);
+            LOG_ERR("output path '%s' is not a FIFO\n", g_app.output_path);
             stop_flag = 1;
             return NULL;
         }
@@ -842,7 +970,7 @@ static void* output_thread(void *arg) {
         // the fd to blocking mode so writes are all-or-nothing (no partial-frame
         // corruption on EAGAIN).
         if (g_app.output_fd < 0 && g_app.output_path) {
-            int fd = open(g_app.output_path, O_WRONLY | O_NONBLOCK);
+            int fd = open(g_app.output_path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
             if (fd >= 0) {
                 int flags = fcntl(fd, F_GETFL);
                 if (flags >= 0) (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
@@ -864,7 +992,7 @@ static void* output_thread(void *arg) {
                We drop this processed block (no output) and try to reconnect.
                In normal use, start the FIFO consumer (e.g. GQRX or mbuffer relay)
                before the producer to avoid drops during startup. */
-            blocks_dropped++;
+            atomic_fetch_add_explicit(&blocks_dropped, 1, memory_order_relaxed);
             spsc_push(&free_queue, buf);
             struct timespec ts = {0, 2000000}; // 2 ms
             nanosleep(&ts, NULL);
@@ -900,7 +1028,6 @@ static void* output_thread(void *arg) {
         }
         
         // Return buffer to free pool
-        buf->state = 0;
         spsc_push(&free_queue, buf);
     }
     
@@ -920,60 +1047,115 @@ static void signal_handler(int sig) {
     stop_flag = 1;
 }
 
-
-
-static void usage(FILE *out) {
-    fprintf(out,
-        "Usage: %s [OPTIONS]\n"
-        "High-rate rx888 decimator: stdin int16 real @135e6 -> stdout/FIFO complex float32 IQ @33.75e6.\n\n"
-        "Options:\n"
-        "  -o PATH           Write IQ to PATH (FIFO recommended); default stdout\n"
-        "  -v                Verbose\n"
-        "  --block-on-full   Block (no drops) when queues are full (benchmark/backpressure mode)\n"
-        "  -h, --help        Show this help\n",
-        PROGRAM_NAME);
+static void sigusr1_handler(int sig) {
+    (void)sig;
+    stats_req_flag = 1;
 }
+
+
+
+
+static void print_version(FILE *out) {
+    fprintf(out, "%s %s\n", PROGRAM_NAME, RX888_DSP_VERSION);
+}
+
+static void usage_short(FILE *out) {
+    fprintf(out, "Usage: %s [OPTIONS]\n", PROGRAM_NAME);
+    fprintf(out, "Try '%s --help' for more information.\n", PROGRAM_NAME);
+}
+
+static void help_long(FILE *out) {
+    fprintf(out,
+            "Usage: %s [OPTIONS]\\n"
+            "\\n"
+            "High-rate rx888 decimator:\\n"
+            "  stdin  : int16 real @ 135e6 samples/sec\\n"
+            "  stdout : complex float32 IQ @ 33.75e6 samples/sec (Fs/4)\\n"
+            "\\n"
+            "Options:\\n"
+            "  -h, --help               Show this help\\n"
+            "  -o, --output PATH        Write IQ to PATH (FIFO); default stdout\\n"
+            "  -v, --verbose            Verbose logging + performance statistics\\n"
+            "  -V, --version            Show version\\n"
+            "      --block-on-full      Backpressure instead of dropping when output is slow\\n"
+            "\\n"
+            "Notes:\\n"
+            "  * This is a Unix filter. Provide input via a pipe or redirection.\\n"
+            "  * Output is binary float32 IQ. Redirect to a FIFO or file.\\n"
+            "  * Send SIGUSR1 to print a one-line status summary to stderr.\\n"
+            "    (With -v, prints a detailed multi-line statistics block.)\\n"
+            "\\n"
+            "Exit status:\\n"
+            "  0  success\\n"
+            "  1  operational error (I/O, memory, thread creation)\\n"
+            "  2  usage error (invalid arguments, TTY detected)\\n"
+            "\\n"
+            "Examples:\\n"
+            "  cat capture.i16 | %s --block-on-full -v > /tmp/iq.fifo\\n"
+            "\\n",
+            PROGRAM_NAME, PROGRAM_NAME);
+}
+
 
 //=============================================================================
 // Main
 //=============================================================================
 
+
 int main(int argc, char **argv) {
-    
-    for (int i = 1; i < argc; i++) {
-    if ((strcmp(argv[i], "-h") == 0) || (strcmp(argv[i], "--help") == 0)) {
-        usage(stdout);
-        return 0;
-    } else if (strcmp(argv[i], "-o") == 0 && i+1 < argc) {
-        g_app.output_path = argv[++i];
-    } else if (strcmp(argv[i], "-v") == 0) {
-        g_app.verbose = 1;
-    } else if (strcmp(argv[i], "--block-on-full") == 0) {
-        g_app.block_on_full = 1;
-    } else {
-        LOG_ERR("Unknown option: %s\n", argv[i]);
-        usage(stderr);
-        return 2;
-    }
-} 
+    /* -------- option parsing (GNU-ish) -------- */
+    static const struct option long_opts[] = {
+        {"output", required_argument, 0, 'o'},
+        {"verbose", no_argument, 0, 'v'},
+        {"block-on-full", no_argument, 0, 1000},
+        {"help", no_argument, 0, 'h'},
+        {"version", no_argument, 0, 'V'},
+        {0, 0, 0, 0},
+    };
 
-    /* Fail fast on an invalid output path. If -o is supplied we require a FIFO.
-       (The output thread repeats a similar check to handle runtime changes.) */
-    if (g_app.output_path) {
-        struct stat st;
-        if (stat(g_app.output_path, &st) != 0) {
-            LOG_ERR("FATAL: output path '%s' not found (create with: mkfifo %s)\n",
-                    g_app.output_path, g_app.output_path);
-            return 2;
-        }
-        if (!S_ISFIFO(st.st_mode)) {
-            LOG_ERR("FATAL: output path '%s' is not a FIFO\n", g_app.output_path);
-            return 2;
+    int opt;
+    while ((opt = getopt_long(argc, argv, "o:vhV", long_opts, NULL)) != -1) {
+        switch (opt) {
+        case 'o':
+            g_app.output_path = optarg;
+            break;
+        case 'v':
+            g_app.verbose = 1;
+            break;
+        case 'h':
+            help_long(stdout);
+            return 0;
+        case 'V':
+            print_version(stdout);
+            return 0;
+        case 1000:
+            g_app.block_on_full = 1;
+            break;
+        default:
+            usage_short(stderr);
+            return EXIT_USAGE;
         }
     }
 
-    /* Signal handling: use sigaction() for reliability (avoid SA_RESTART). */
-{
+    if (optind < argc) {
+        LOG_ERR("unexpected argument: '%s'\n", argv[optind]);
+        usage_short(stderr);
+        return EXIT_USAGE;
+    }
+
+    /* -------- TTY safety rails -------- */
+    if (isatty(STDIN_FILENO)) {
+        LOG_ERR("stdin is a TTY; provide input via a pipe or redirection\n");
+        usage_short(stderr);
+        return EXIT_USAGE;
+    }
+    if (g_app.output_path == NULL && isatty(STDOUT_FILENO)) {
+        LOG_ERR("stdout is a TTY; redirect output or use -o PATH (FIFO)\n");
+        usage_short(stderr);
+        return EXIT_USAGE;
+    }
+
+    /* -------- signals -------- */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
@@ -984,142 +1166,134 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
 
+    struct sigaction su;
+    memset(&su, 0, sizeof(su));
+    su.sa_handler = sigusr1_handler;
+    sigemptyset(&su.sa_mask);
+    su.sa_flags = 0;
+    sigaction(SIGUSR1, &su, NULL);
+
     /* Broken pipe is expected if the FIFO consumer exits. */
-    signal(SIGPIPE, SIG_IGN);
-}    // Initialize folded coefficients for HB2
+    struct sigaction sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.sa_handler = SIG_IGN;
+    sigemptyset(&sp.sa_mask);
+    sp.sa_flags = 0;
+    sigaction(SIGPIPE, &sp, NULL);
+
+    /* -------- init DSP -------- */
     init_hb2_coeffs();
-    
-    // Allocate history buffers
-    hb1_histI = calloc(HB1_LEN - 1, sizeof(float));
-    hb1_histQ = calloc(HB1_LEN - 1, sizeof(float));
-    hb2_histI = calloc(HB2_LEN - 1, sizeof(float));
-    hb2_histQ = calloc(HB2_LEN - 1, sizeof(float));
-    
-    if (!hb1_histI || !hb1_histQ || !hb2_histI || !hb2_histQ) {
-        LOG_ERR("FATAL: failed to allocate history buffers\n");
-        free(hb1_histI); free(hb1_histQ); free(hb2_histI); free(hb2_histQ);
-        return 1;
-    }
-    
-    // Initialize queues
+
+    /* -------- init buffer pool + queues -------- */
     spsc_init(&free_queue);
     spsc_init(&filled_queue);
     spsc_init(&ready_queue);
-    
-    // Push all buffers to free queue
     for (int i = 0; i < NUM_BUFFERS; i++) {
-        buffer_pool[i].state = 0;
         spsc_push(&free_queue, &buffer_pool[i]);
     }
-    
-    LOG_INFO("=== rx888-decimate ===\n");
-    LOG_INFO("Architecture: buffer pool + streaming FIR\n");
-    LOG_INFO("HB2: folded halfband (59 pairs)\n");
-    LOG_INFO("Output: %s\n\n", g_app.output_path ? g_app.output_path : "stdout");
-    
-    // Start worker threads
-pthread_t proc_thread, out_thread;
-int rc;
 
-rc = pthread_create(&proc_thread, NULL, processing_thread, NULL);
-if (rc != 0) {
-    LOG_ERR("FATAL: pthread_create(processing_thread) failed: %s\n", strerror(rc));
-    free(hb1_histI); free(hb1_histQ); free(hb2_histI); free(hb2_histQ);
-    return 1;
-}
+    if (g_app.verbose) {
+        fprintf(stderr, PROGRAM_NAME ": === rx888-decimate ===\n");
+        fprintf(stderr, PROGRAM_NAME ": Architecture: buffer pool + streaming FIR\n");
+        fprintf(stderr, PROGRAM_NAME ": HB2: folded halfband (59 pairs)\n");
+        fprintf(stderr, PROGRAM_NAME ": Output: %s\n", g_app.output_path ? g_app.output_path : "stdout");
+        fprintf(stderr, "\n");
+    }
 
-rc = pthread_create(&out_thread, NULL, output_thread, NULL);
-if (rc != 0) {
-    LOG_ERR("FATAL: pthread_create(output_thread) failed: %s\n", strerror(rc));
-    stop_flag = 1;
-    pthread_join(proc_thread, NULL);
-    free(hb1_histI); free(hb1_histQ); free(hb2_histI); free(hb2_histQ);
-    return 1;
-}
-    
-    // Input loop: pop from free, read, push to filled
+    pthread_t proc_thread, out_thread;
+    int rc;
+
+    rc = pthread_create(&proc_thread, NULL, processing_thread, NULL);
+    if (rc != 0) {
+        LOG_ERR("pthread_create(processing_thread) failed: %s\n", strerror(rc));
+        return 1;
+    }
+
+    rc = pthread_create(&out_thread, NULL, output_thread, NULL);
+    if (rc != 0) {
+        LOG_ERR("pthread_create(output_thread) failed: %s\n", strerror(rc));
+        stop_flag = 1;
+        pthread_join(proc_thread, NULL);
+        return 1;
+    }
+
+    /* -------- main input loop -------- */
     while (!stop_flag) {
         buffer_t *buf = spsc_pop(&free_queue);
         if (!buf) {
-            // No free buffers available.
-            // In --block-on-full mode (benchmarking / backpressurable sources), wait.
-            // Otherwise count this as a dropped block (what would happen with a non-backpressurable SDR source).
-            if (!g_app.block_on_full) {
-                blocks_dropped++;
+            /* No free buffers: either block or drop, depending on mode. */
+            if (g_app.block_on_full) {
+                struct timespec ts = {0, 100000};
+                nanosleep(&ts, NULL);
+                continue;
             }
+            atomic_fetch_add_explicit(&blocks_dropped, 1, memory_order_relaxed);
+            /* Brief sleep to avoid busy spinning. */
             struct timespec ts = {0, 100000};
             nanosleep(&ts, NULL);
             continue;
         }
-        
+
         ssize_t n = read_full(STDIN_FILENO, buf->input, INPUT_SAMPLES * sizeof(int16_t));
-        
-        if (n == (ssize_t)(INPUT_SAMPLES * sizeof(int16_t))) {
-            buf->state = 1;
-            if (!spsc_push(&filled_queue, buf)) {
-                // Filled queue full (should be rare with proper sizing).
-                if (g_app.block_on_full) {
-                    while (!stop_flag && !spsc_push(&filled_queue, buf)) {
-                        struct timespec ts = {0, 100000};
-                        nanosleep(&ts, NULL);
-                    }
-                    if (stop_flag) {
-                        spsc_push(&free_queue, buf);
-                    }
-                } else {
-                    blocks_dropped++;
-                    spsc_push(&free_queue, buf);  // Give back if can't queue
-                }
-            }
-        } else if (n == 0) {
-            // EOF
-            spsc_push(&free_queue, buf);
-            break;
-        } else if (n < 0) {
-            perror("read");
-            spsc_push(&free_queue, buf);
-            break;
-        } else {
-            // Partial block: treat as end-of-stream (e.g., producer exited).
-            LOG_ERR("Input stream ended mid-block (%zd bytes).\n", n);
-            spsc_push(&free_queue, buf);
+        if (n == 0) {
+            break; /* clean EOF */
+        }
+        if (n < 0) {
+            LOG_SYSERR("read");
             break;
         }
+        if ((size_t)n < INPUT_SAMPLES * sizeof(int16_t)) {
+            LOG_ERR("Input stream ended mid-block (%zd bytes).\n", n);
+            break;
+        }
+
+        if (!spsc_push(&filled_queue, buf)) {
+            if (g_app.block_on_full) {
+                while (!stop_flag && !spsc_push(&filled_queue, buf)) {
+                    struct timespec ts = {0, 100000};
+                    nanosleep(&ts, NULL);
+                }
+                if (stop_flag) {
+                    spsc_push(&free_queue, buf);
+                    break;
+                }
+            } else {
+                atomic_fetch_add_explicit(&blocks_dropped, 1, memory_order_relaxed);
+                spsc_push(&free_queue, buf);
+            }
+        }
     }
-    
+
+    /* Request shutdown and unblock threads. */
     stop_flag = 1;
     pthread_join(proc_thread, NULL);
     pthread_join(out_thread, NULL);
-    
-    if (g_app.verbose) {
-    fprintf(stderr, "\n=== Statistics ===\n");
-    fprintf(stderr, "Blocks processed: %lu\n", stats.total_blocks);
-    
-{
-    const unsigned long total = stats.total_blocks + blocks_dropped;
-    if (total > 0) {
-        fprintf(stderr, "Blocks dropped:   %lu (%.2f%%)\n", blocks_dropped,
-                100.0 * (double)blocks_dropped / (double)total);
-    } else {
-        fprintf(stderr, "Blocks dropped:   %lu (no data processed)\n", blocks_dropped);
-    }
-}
-    fprintf(stderr, "Time/block: avg %.2f ms (min %.2f, max %.2f)\n",
-            stats.avg_time_ms, stats.min_time_ms, stats.max_time_ms);
-    fprintf(stderr, "Budget @ 135 MSPS: 1.94 ms/block\n");
-    if (stats.avg_time_ms > 0) {
-        fprintf(stderr, "Headroom: %.1f%%\n",
-                100.0 * (1.94 - stats.avg_time_ms) / 1.94);
-    }
-    fprintf(stderr, "Samples output: %lu\n", samples_processed);
-}
 
-    
-    if (g_app.output_fd >= 0) close(g_app.output_fd);
-    free(hb1_histI);
-    free(hb1_histQ);
-    free(hb2_histI);
-    free(hb2_histQ);
-    
+    if (g_app.verbose) {
+        const unsigned long dropped = atomic_load_explicit(&blocks_dropped, memory_order_relaxed);
+        fprintf(stderr, "\n=== Statistics ===\n");
+        fprintf(stderr, "Blocks processed: %lu\n", stats.total_blocks);
+        {
+            const unsigned long total = stats.total_blocks + dropped;
+            if (total > 0) {
+                fprintf(stderr, "Blocks dropped:   %lu (%.2f%%)\n", dropped,
+                        100.0 * (double)dropped / (double)total);
+            } else {
+                fprintf(stderr, "Blocks dropped:   %lu (no data processed)\n", dropped);
+            }
+        }
+        fprintf(stderr, "Time/block: avg %.2f ms (min %.2f, max %.2f)\n", stats.avg_time_ms,
+                stats.min_time_ms, stats.max_time_ms);
+        fprintf(stderr, "Budget @ 135 MSPS: 1.94 ms/block\n");
+        if (stats.avg_time_ms > 0) {
+            fprintf(stderr, "Headroom: %.1f%%\n", 100.0 * (1.94 - stats.avg_time_ms) / 1.94);
+        }
+        fprintf(stderr, "Samples output: %lu\n", samples_processed);
+    }
+
+    if (g_app.output_fd >= 0) {
+        close(g_app.output_fd);
+    }
+
     return 0;
 }
